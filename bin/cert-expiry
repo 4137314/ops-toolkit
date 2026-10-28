@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Check TLS certificate expiry for remote endpoints and local PEM files.
+set -euo pipefail
+# shellcheck source=lib/common.sh
+source "${OPS_LIB:-$(dirname "$(readlink -f "$0")")/../lib}/common.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: cert-expiry [-w DAYS] [-c DAYS] [-f text|json|prom] [-t SECONDS] TARGET...
+
+TARGET is host, host:port, or a path to a PEM certificate file.
+  -w DAYS     warn when fewer days remain (default 21)
+  -c DAYS     critical when fewer days remain (default 7)
+  -f FORMAT   text (default), json, or prom (node_exporter textfile)
+  -t SECONDS  connection timeout (default 10)
+Exit codes: 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN.
+EOF
+}
+
+warn=21 crit=7 timeout=10
+while getopts ':w:c:f:t:h' opt; do
+	case $opt in
+	w) warn=$OPTARG ;;
+	c) crit=$OPTARG ;;
+	f) ops_set_format "$OPTARG" ;;
+	t) timeout=$OPTARG ;;
+	h) usage && exit 0 ;;
+	*) usage >&2 && exit "$OPS_UNKNOWN" ;;
+	esac
+done
+shift $((OPTIND - 1))
+(($# > 0)) || {
+	usage >&2
+	exit "$OPS_UNKNOWN"
+}
+[[ $warn =~ ^[0-9]+$ && $crit =~ ^[0-9]+$ && $timeout =~ ^[0-9]+$ ]] || ops_die "thresholds and timeout must be integers"
+
+enddate() {
+	local target=$1 host port
+	if [[ -f $target ]]; then
+		openssl x509 -noout -enddate -in "$target"
+		return
+	fi
+	host=${target%:*}
+	port=443
+	[[ $target == *:* ]] && port=${target##*:}
+	timeout "$timeout" openssl s_client -connect "$host:$port" -servername "$host" </dev/null 2>/dev/null |
+		openssl x509 -noout -enddate
+}
+
+now=$(date +%s)
+for target in "$@"; do
+	if ! line=$(enddate "$target" 2>/dev/null) || [[ $line != notAfter=* ]]; then
+		ops_row "$OPS_CRIT" "$target" ops_cert_expiry_seconds "" "unable to read certificate"
+		continue
+	fi
+	expiry=$(date -d "${line#notAfter=}" +%s) || ops_die "cannot parse date: ${line#notAfter=}"
+	seconds=$((expiry - now))
+	days=$((seconds / 86400))
+	status=$OPS_OK
+	((days < warn)) && status=$OPS_WARN
+	((days < crit)) && status=$OPS_CRIT
+	if ((seconds <= 0)); then
+		ops_row "$OPS_CRIT" "$target" ops_cert_expiry_seconds "$seconds" "expired $((-days)) days ago"
+	else
+		ops_row "$status" "$target" ops_cert_expiry_seconds "$seconds" "expires in $days days ($(date -u -d "@$expiry" +%F))"
+	fi
+done
+ops_emit cert-expiry

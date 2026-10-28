@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Verify that a restic repository has a recent snapshot and optionally test its data.
+set -euo pipefail
+# shellcheck source=lib/common.sh
+source "${OPS_LIB:-$(dirname "$(readlink -f "$0")")/../lib}/common.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: backup-verify [-w HOURS] [-c HOURS] [-H HOST] [-T TAG] [-s SUBSET] [-f text|json|prom]
+
+Uses the standard restic environment (RESTIC_REPOSITORY, RESTIC_PASSWORD_FILE, ...).
+  -w HOURS   warn if the newest snapshot is older (default 26)
+  -c HOURS   critical if older (default 50)
+  -H HOST    only consider snapshots from this host
+  -T TAG     only consider snapshots with this tag
+  -s SUBSET  also run `restic check --read-data-subset=SUBSET` (e.g. 1% or 1/10)
+  -f FORMAT  text (default), json, or prom
+EOF
+}
+
+warn=26 crit=50 subset=""
+filters=()
+while getopts ':w:c:H:T:s:f:h' opt; do
+	case $opt in
+	w) warn=$OPTARG ;;
+	c) crit=$OPTARG ;;
+	H) filters+=(--host "$OPTARG") ;;
+	T) filters+=(--tag "$OPTARG") ;;
+	s) subset=$OPTARG ;;
+	f) ops_set_format "$OPTARG" ;;
+	h) usage && exit 0 ;;
+	*) usage >&2 && exit "$OPS_UNKNOWN" ;;
+	esac
+done
+[[ $warn =~ ^[0-9]+$ && $crit =~ ^[0-9]+$ ]] || ops_die "thresholds must be integers"
+command -v restic >/dev/null || ops_die "restic not found"
+command -v jq >/dev/null || ops_die "jq not found"
+
+repo=${RESTIC_REPOSITORY:-restic}
+repo=${repo/\/\/*@/\/\/} # never print credentials embedded in the URL
+json=$(restic snapshots --json --latest 1 "${filters[@]}") || ops_die "restic snapshots failed"
+latest=$(jq -r 'map(.time) | sort | last // empty' <<<"$json")
+
+if [[ -z $latest ]]; then
+	ops_row "$OPS_CRIT" "$repo" ops_backup_age_seconds "" "no snapshots found"
+else
+	age=$(($(date +%s) - $(date -d "$latest" +%s)))
+	hours=$((age / 3600))
+	status=$OPS_OK
+	((hours >= warn)) && status=$OPS_WARN
+	((hours >= crit)) && status=$OPS_CRIT
+	ops_row "$status" "$repo" ops_backup_age_seconds "$age" "newest snapshot is ${hours}h old ($latest)"
+fi
+
+if [[ -n $subset ]]; then
+	if restic check --read-data-subset="$subset" >/dev/null 2>&1; then
+		ops_row "$OPS_OK" "$repo" ops_backup_check_ok 1 "check of $subset passed"
+	else
+		ops_row "$OPS_CRIT" "$repo" ops_backup_check_ok 0 "check of $subset FAILED"
+	fi
+fi
+ops_emit backup-verify

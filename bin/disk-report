@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Report block and inode usage per mounted filesystem.
+set -euo pipefail
+# shellcheck source=lib/common.sh
+source "${OPS_LIB:-$(dirname "$(readlink -f "$0")")/../lib}/common.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: disk-report [-w PCT] [-c PCT] [-f text|json|prom] [-x FSTYPE]... [MOUNTPOINT...]
+
+Checks all local filesystems unless mount points are given.
+  -w PCT     warn at this block or inode usage (default 80)
+  -c PCT     critical at this usage (default 90)
+  -x FSTYPE  additional filesystem type to exclude (repeatable)
+  -f FORMAT  text (default), json, or prom
+EOF
+}
+
+warn=80 crit=90
+excludes=(tmpfs devtmpfs overlay squashfs efivarfs ramfs)
+while getopts ':w:c:f:x:h' opt; do
+	case $opt in
+	w) warn=$OPTARG ;;
+	c) crit=$OPTARG ;;
+	f) ops_set_format "$OPTARG" ;;
+	x) excludes+=("$OPTARG") ;;
+	h) usage && exit 0 ;;
+	*) usage >&2 && exit "$OPS_UNKNOWN" ;;
+	esac
+done
+shift $((OPTIND - 1))
+[[ $warn =~ ^[0-9]+$ && $crit =~ ^[0-9]+$ ]] || ops_die "thresholds must be integers"
+
+args=(-l "--output=target,pcent,ipcent")
+for fs in "${excludes[@]}"; do
+	args+=(-x "$fs")
+done
+
+classify() {
+	local pct=$1
+	if [[ $pct == - ]]; then
+		printf '%s' "$OPS_OK"
+	elif ((pct >= crit)); then
+		printf '%s' "$OPS_CRIT"
+	elif ((pct >= warn)); then
+		printf '%s' "$OPS_WARN"
+	else
+		printf '%s' "$OPS_OK"
+	fi
+}
+
+# df exits non-zero when any single mount is unreadable (e.g. inside a systemd
+# sandbox) while still reporting the others; only fail when nothing was reported.
+output=$(df "${args[@]}" "$@" 2>/dev/null) || true
+(($(wc -l <<<"$output") > 1)) || ops_die "df reported no filesystems"
+while read -r line; do
+	# Mount points may contain spaces; the two percentages are always last.
+	ipcent=${line##* }
+	line=${line% *}
+	pcent=${line##* }
+	target=${line% *}
+	target=${target%"${target##*[! ]}"}
+	blocks=${pcent%\%}
+	inodes=${ipcent%\%}
+	bstatus=$(classify "$blocks")
+	istatus=$(classify "$inodes")
+	ops_row "$bstatus" "$target" ops_disk_used_percent "$blocks" "blocks ${blocks}%"
+	if [[ $inodes != - ]]; then
+		ops_row "$istatus" "$target" ops_disk_inodes_used_percent "$inodes" "inodes ${inodes}%"
+	fi
+done < <(tail -n +2 <<<"$output")
+ops_emit disk-report

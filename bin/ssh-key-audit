@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Audit authorized_keys files for weak algorithms and keys shared between accounts.
+set -euo pipefail
+# shellcheck source=lib/common.sh
+source "${OPS_LIB:-$(dirname "$(readlink -f "$0")")/../lib}/common.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: ssh-key-audit [-b BITS] [-f text|json|prom] [AUTHORIZED_KEYS...]
+
+Without arguments, audits ~/.ssh/authorized_keys for every account in getent passwd
+(run as root for a full audit).
+  -b BITS    minimum RSA size (default 3072)
+  -f FORMAT  text (default), json, or prom
+Findings: DSA or RSA-1 keys are CRITICAL, short RSA keys and keys reused by
+several accounts are WARNING.
+EOF
+}
+
+min_rsa=3072
+while getopts ':b:f:h' opt; do
+	case $opt in
+	b) min_rsa=$OPTARG ;;
+	f) ops_set_format "$OPTARG" ;;
+	h) usage && exit 0 ;;
+	*) usage >&2 && exit "$OPS_UNKNOWN" ;;
+	esac
+done
+shift $((OPTIND - 1))
+[[ $min_rsa =~ ^[0-9]+$ ]] || ops_die "-b must be an integer"
+
+files=("$@")
+if ((${#files[@]} == 0)); then
+	while IFS=: read -r _ _ _ _ _ home _; do
+		[[ -r $home/.ssh/authorized_keys ]] && files+=("$home/.ssh/authorized_keys")
+	done < <(getent passwd)
+fi
+
+declare -A owners=()
+for file in "${files[@]}"; do
+	[[ -r $file ]] || {
+		ops_row "$OPS_UNKNOWN" "$file" ops_ssh_keys_total "" "not readable"
+		continue
+	}
+	count=0
+	# Format: "<bits> <fingerprint> <comment...> (<TYPE>)"
+	while read -r bits fingerprint rest; do
+		[[ $fingerprint == SHA256:* ]] || continue
+		count=$((count + 1))
+		type=${rest##*(}
+		type=${type%)}
+		owners[$fingerprint]+="$file "
+		case $type in
+		DSA | RSA1)
+			ops_row "$OPS_CRIT" "$file" "" "" "$type key $fingerprint is obsolete"
+			;;
+		RSA)
+			((bits < min_rsa)) && ops_row "$OPS_WARN" "$file" "" "" "RSA-$bits key $fingerprint is below $min_rsa bits"
+			;;
+		esac
+	done < <(ssh-keygen -l -f "$file" 2>/dev/null || true)
+	ops_row "$OPS_OK" "$file" ops_ssh_keys_total "$count" "$count keys"
+done
+
+for fingerprint in "${!owners[@]}"; do
+	read -r -a where <<<"${owners[$fingerprint]}"
+	if ((${#where[@]} > 1)); then
+		ops_row "$OPS_WARN" "$fingerprint" "" "" "shared by ${where[*]}"
+	fi
+done
+ops_emit ssh-key-audit
