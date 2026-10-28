@@ -121,3 +121,12 @@ esac'
 	[ "$(grep -c '^# TYPE' <<<"$output")" -eq 3 ]
 	[ "$(grep -v '^#' <<<"$output" | cut -d'{' -f1 | uniq | wc -l)" -eq 3 ]
 }
+
+@test "disk-report: parses real df column padding" {
+	stub df 'printf "Mounted on                  Use%% IUse%%\n/                            42%%    1%%\n/mnt/my disk                  7%%     -\n/boot                        100%%   12%%\n"'
+	run disk-report -f json
+	[ "$status" -eq 2 ]
+	[[ $output == *'{"target":"/","status":"OK","metric":"ops_disk_used_percent","value":42'* ]]
+	[[ $output == *'{"target":"/mnt/my disk","status":"OK","metric":"ops_disk_used_percent","value":7'* ]]
+	[[ $output == *'{"target":"/boot","status":"CRITICAL","metric":"ops_disk_used_percent","value":100'* ]]
+}
